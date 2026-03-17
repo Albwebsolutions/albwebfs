@@ -168,6 +168,11 @@ pub const ENV_RUSTFS_REGION: &str = "RUSTFS_REGION";
 /// Environment variable for server license.
 pub const ENV_RUSTFS_LICENSE: &str = "RUSTFS_LICENSE";
 
+/// Environment variable for fixed HostId in S3 error responses.
+/// When set (e.g. in /etc/default/rustfs), this value is used instead of a per-response UUID.
+/// Example: RUSTFS_HOST_ID="albwebfs-os-fsn1-001"
+pub const ENV_RUSTFS_HOST_ID: &str = "RUSTFS_HOST_ID";
+
 /// Default log filename for rustfs
 /// This is the default log filename for rustfs.
 /// It is used to store the logs of the application.

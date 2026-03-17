@@ -26,7 +26,6 @@ use crate::server::{
 };
 use crate::storage;
 use crate::storage::tonic_service::make_server;
-use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo, TokioTimer},
@@ -645,27 +644,28 @@ fn process_connection(
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("unknown");
 
-                        let parent_context = global::get_text_map_propagator(|propagator| {
-                            propagator.extract(&HeaderMapCarrier::new(request.headers()))
-                        });
-
-                        // Extract real client IP from trusted proxy middleware if available
-                        let client_info = request.extensions().get::<ClientInfo>();
-                        let real_ip = client_info
-                            .map(|info| info.real_ip.to_string())
-                            .unwrap_or_else(|| "unknown".to_string());
-
                         let span = tracing::info_span!("http-request",
                             trace_id = %trace_id,
                             status_code = tracing::field::Empty,
                             method = %request.method(),
-                            real_ip = %real_ip,
+                            real_ip = tracing::field::Empty,
                             uri = %request.uri(),
                             version = ?request.version(),
                         );
                         if span.is_disabled() {
                             return span;
                         }
+
+                        // Avoid extra per-request work when the span is disabled.
+                        let parent_context = global::get_text_map_propagator(|propagator| {
+                            propagator.extract(&HeaderMapCarrier::new(request.headers()))
+                        });
+                        let client_info = request.extensions().get::<ClientInfo>();
+                        let real_ip = client_info
+                            .map(|info| info.real_ip.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        span.record("real_ip", tracing::field::display(real_ip));
                         if let Err(e) = span.set_parent(parent_context) {
                             warn!("Failed to propagate tracing context: `{:?}`", e);
                         }
@@ -688,11 +688,6 @@ fn process_connection(
                         let _enter = span.enter();
                         histogram!("rustfs.request.latency.ms").record(latency.as_millis() as f64);
                         debug!("http response generated in {:?}", latency)
-                    })
-                    .on_body_chunk(|chunk: &Bytes, latency: Duration, span: &Span| {
-                        let _enter = span.enter();
-                        histogram!("rustfs.request.body.len").record(chunk.len() as f64);
-                        debug!("http body sending {} bytes in {:?}", chunk.len(), latency);
                     })
                     .on_eos(|_trailers: Option<&HeaderMap>, stream_duration: Duration, span: &Span| {
                         let _enter = span.enter();

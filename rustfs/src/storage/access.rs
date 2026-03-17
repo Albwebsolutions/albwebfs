@@ -142,6 +142,20 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         }
         let bucket_name = req_info.bucket.as_deref().unwrap_or("");
 
+        // Per AWS S3: return NoSuchBucket (404) for non-existent buckets before policy evaluation.
+        // Otherwise PolicySys returns deny (no policy) and we incorrectly return AccessDenied (403).
+        // Skip for CreateBucket since the bucket does not exist yet.
+        if !bucket_name.is_empty()
+            && !matches!(action, Action::S3Action(S3Action::CreateBucketAction))
+            && if let Some(store) = new_object_layer_fn() {
+                store.get_bucket_info(bucket_name, &Default::default()).await.is_err_and(|e| is_err_bucket_not_found(e))
+            } else {
+                false
+            }
+        {
+            return Err(s3_error!(NoSuchBucket, "The specified bucket does not exist"));
+        }
+
         // Per AWS S3: root can always perform GetBucketPolicy, PutBucketPolicy, DeleteBucketPolicy
         // even if bucket policy explicitly denies. Other actions (ListBucket, GetObject, etc.) are
         // subject to bucket policy Deny for root as well. See: repost.aws/knowledge-center/s3-accidentally-denied-access

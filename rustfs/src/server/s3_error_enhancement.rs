@@ -15,7 +15,8 @@
 //! S3 error response enhancement layer.
 //!
 //! Transforms minimal S3 XML error responses into professional, enterprise-grade
-//! error pages with albwebfs branding, RequestId, HostId, and proper structure.
+//! error pages with albwebfs branding, RequestId, HostId, Resource, and proper
+//! structure. AWS S3-compatible format with Retry-After for throttling/503.
 
 use bytes::Bytes;
 use http::{HeaderValue, Request, Response, StatusCode, header::CONTENT_TYPE};
@@ -23,6 +24,7 @@ use http_body::Body;
 use http_body_util::{BodyExt, Full};
 use quick_xml::de::from_str;
 use quick_xml::se::to_string;
+use rustfs_config::ENV_RUSTFS_HOST_ID;
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
 use std::task::{Context, Poll};
@@ -147,6 +149,7 @@ where
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let mut inner = self.inner.clone();
+        let uri = req.uri().clone();
         let future = inner.call(req);
 
         Box::pin(async move {
@@ -178,44 +181,97 @@ where
             };
 
             let enhanced_body = if is_xml {
-                enhance_s3_error_xml(&body_bytes, &parts.headers, status)
+                enhance_s3_error_xml(&body_bytes, &parts.headers, status, &uri)
             } else {
                 body_bytes
             };
 
-            // Set Server header for all error responses
+            // Enterprise: Server header, Content-Type, X-Amz-Request-Id, Retry-After
             parts
                 .headers
                 .insert(http::header::SERVER, HeaderValue::from_static(SERVER_HEADER_VALUE));
+
+            if is_xml {
+                parts.headers.insert(
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("application/xml; charset=utf-8"),
+                );
+            }
+
+            if let Some(rid) = parts.headers.get("x-request-id") {
+                parts.headers.insert(
+                    http::header::HeaderName::from_static("x-amz-request-id"),
+                    rid.clone(),
+                );
+            }
+
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                parts.headers.insert(
+                    http::header::RETRY_AFTER,
+                    HeaderValue::from_static("1"),
+                );
+            } else if status == StatusCode::SERVICE_UNAVAILABLE {
+                parts.headers.insert(
+                    http::header::RETRY_AFTER,
+                    HeaderValue::from_static("60"),
+                );
+            }
 
             Ok(Response::from_parts(parts, Full::new(enhanced_body)))
         })
     }
 }
 
-/// Enhances S3 error XML with RequestId, HostId, and professional structure.
-fn enhance_s3_error_xml(body: &[u8], headers: &http::HeaderMap, status: StatusCode) -> Bytes {
+/// Parses bucket and key from path-style S3 URI path (e.g. /bucket, /bucket/key, /bucket/key/sub).
+fn parse_bucket_key_from_path(path: &str) -> (Option<String>, Option<String>) {
+    let path = path.trim_start_matches('/');
+    if path.is_empty() {
+        return (None, None);
+    }
+    let segments: Vec<&str> = path.splitn(2, '/').collect();
+    let bucket = segments.first().filter(|s| !s.is_empty()).map(|s| (*s).to_string());
+    let key = segments.get(1).filter(|s| !s.is_empty()).map(|s| (*s).to_string());
+    (bucket, key)
+}
+
+/// Enhances S3 error XML with RequestId, HostId, Resource, BucketName, Key, and professional structure.
+fn enhance_s3_error_xml(
+    body: &[u8],
+    headers: &http::HeaderMap,
+    status: StatusCode,
+    uri: &http::Uri,
+) -> Bytes {
     let body_str = match std::str::from_utf8(body) {
         Ok(s) => s,
         Err(_) => return Bytes::copy_from_slice(body),
     };
 
+    let (bucket, key) = parse_bucket_key_from_path(uri.path());
+    let resource = uri.path().trim_start_matches('/');
+    let resource = if resource.is_empty() {
+        String::new()
+    } else {
+        format!("/{resource}")
+    };
+
     let mut err: S3ErrorXml = match from_str(body_str) {
         Ok(e) => e,
         Err(_) => {
-            // Not valid XML or wrong structure - build minimal error from status
             let (code, message) = status_to_code_and_message(status);
-            return build_enhanced_xml(S3ErrorXml {
+            let fallback = S3ErrorXml {
                 code,
                 message,
                 request_id: generate_request_id(headers),
                 host_id: generate_host_id(),
+                resource: resource.clone(),
+                bucket_name: bucket.clone().unwrap_or_default(),
+                key: key.clone().unwrap_or_default(),
                 ..Default::default()
-            });
+            };
+            return build_enhanced_xml(fallback);
         }
     };
 
-    // Fill in missing fields
     if err.request_id.is_empty() {
         err.request_id = generate_request_id(headers);
     }
@@ -226,6 +282,15 @@ fn enhance_s3_error_xml(body: &[u8], headers: &http::HeaderMap, status: StatusCo
         let (code, message) = status_to_code_and_message(status);
         err.code = code;
         err.message = message;
+    }
+    if err.resource.is_empty() && !resource.is_empty() {
+        err.resource = resource;
+    }
+    if err.bucket_name.is_empty() {
+        err.bucket_name = bucket.unwrap_or_default();
+    }
+    if err.key.is_empty() {
+        err.key = key.unwrap_or_default();
     }
 
     build_enhanced_xml(err)
@@ -240,7 +305,10 @@ fn generate_request_id(headers: &http::HeaderMap) -> String {
 }
 
 fn generate_host_id() -> String {
-    format!("{}{}", HOST_ID_PREFIX, Uuid::new_v4().simple())
+    std::env::var(ENV_RUSTFS_HOST_ID)
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| format!("{}{}", HOST_ID_PREFIX, Uuid::new_v4().simple()))
 }
 
 fn status_to_code_and_message(status: StatusCode) -> (String, String) {
@@ -285,16 +353,47 @@ fn escape_xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_bucket_key_from_path() {
+        assert_eq!(parse_bucket_key_from_path(""), (None, None));
+        assert_eq!(parse_bucket_key_from_path("/"), (None, None));
+        assert_eq!(parse_bucket_key_from_path("/bucket"), (Some("bucket".into()), None));
+        assert_eq!(parse_bucket_key_from_path("/bucket/"), (Some("bucket".into()), None));
+        assert_eq!(parse_bucket_key_from_path("/bucket/key"), (Some("bucket".into()), Some("key".into())));
+        assert_eq!(
+            parse_bucket_key_from_path("/bucket/key/sub"),
+            (Some("bucket".into()), Some("key/sub".into()))
+        );
+    }
+}
+
 fn build_enhanced_xml(err: S3ErrorXml) -> Bytes {
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>{}"#,
-        to_string(&err).unwrap_or_else(|_| format!(
-            r#"<Error><Code>{}</Code><Message>{}</Message><RequestId>{}</RequestId><HostId>{}</HostId></Error>"#,
-            escape_xml(&err.code),
-            escape_xml(&err.message),
-            err.request_id,
-            err.host_id
-        ))
+        to_string(&err).unwrap_or_else(|_| {
+            let mut extra = String::new();
+            if !err.resource.is_empty() {
+                extra.push_str(&format!(r#"<Resource>{}</Resource>"#, escape_xml(&err.resource)));
+            }
+            if !err.bucket_name.is_empty() {
+                extra.push_str(&format!(r#"<BucketName>{}</BucketName>"#, escape_xml(&err.bucket_name)));
+            }
+            if !err.key.is_empty() {
+                extra.push_str(&format!(r#"<Key>{}</Key>"#, escape_xml(&err.key)));
+            }
+            format!(
+                r#"<Error><Code>{}</Code><Message>{}</Message><RequestId>{}</RequestId><HostId>{}</HostId>{}</Error>"#,
+                escape_xml(&err.code),
+                escape_xml(&err.message),
+                err.request_id,
+                err.host_id,
+                extra
+            )
+        })
     );
     Bytes::from(xml)
 }

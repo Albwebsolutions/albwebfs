@@ -15,6 +15,7 @@
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
+use bytes::Bytes;
 use rustfs_ecstore::{
     bucket::tagging::decode_tags_to_map,
     error::{is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found},
@@ -59,13 +60,13 @@ pub(crate) struct ListObjectUnorderedQuery {
 }
 
 pub(crate) struct InMemoryAsyncReader {
-    cursor: std::io::Cursor<Vec<u8>>,
+    cursor: std::io::Cursor<Bytes>,
 }
 
 impl InMemoryAsyncReader {
-    pub(crate) fn new(data: Vec<u8>) -> Self {
+    pub(crate) fn new(data: impl Into<Bytes>) -> Self {
         Self {
-            cursor: std::io::Cursor::new(data),
+            cursor: std::io::Cursor::new(data.into()),
         }
     }
 }
@@ -93,6 +94,29 @@ impl AsyncSeek for InMemoryAsyncReader {
 
     fn poll_complete(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<u64>> {
         std::task::Poll::Ready(Ok(self.cursor.position()))
+    }
+}
+
+#[cfg(test)]
+mod in_memory_async_reader_tests {
+    use super::InMemoryAsyncReader;
+    use bytes::Bytes;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    #[tokio::test]
+    async fn supports_zero_copy_bytes_and_seek() {
+        let data = Bytes::from_static(b"abcdef");
+        let mut reader = InMemoryAsyncReader::new(data);
+
+        let mut prefix = [0_u8; 3];
+        reader.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"abc");
+
+        reader.seek(std::io::SeekFrom::Start(2)).await.unwrap();
+
+        let mut rest = Vec::new();
+        reader.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(rest, b"cdef");
     }
 }
 

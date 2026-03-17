@@ -1307,7 +1307,8 @@ impl DefaultObjectUsecase {
                 }
             });
 
-            let cached_response = CachedGetObject::new(Bytes::from(buf.clone()), response_content_length)
+            let body_bytes = Bytes::from(buf);
+            let cached_response = CachedGetObject::new(body_bytes.clone(), response_content_length)
                 .with_content_type(info.content_type.clone().unwrap_or_default())
                 .with_e_tag(info.etag.clone().unwrap_or_default())
                 .with_last_modified(last_modified_str.unwrap_or_default());
@@ -1327,7 +1328,7 @@ impl DefaultObjectUsecase {
             }
 
             // Create response from the in-memory data
-            let mem_reader = InMemoryAsyncReader::new(buf);
+            let mem_reader = InMemoryAsyncReader::new(body_bytes);
             Some(StreamingBlob::wrap(bytes_stream(
                 ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),
                 response_content_length as usize,
@@ -1368,7 +1369,7 @@ impl DefaultObjectUsecase {
                         }
 
                         // Create seekable in-memory reader (similar to MinIO SDK's bytes.Reader)
-                        let mem_reader = InMemoryAsyncReader::new(buf);
+                        let mem_reader = InMemoryAsyncReader::new(Bytes::from(buf));
                         Some(StreamingBlob::wrap(bytes_stream(
                             ReaderStream::with_capacity(Box::new(mem_reader), optimal_buffer_size),
                             response_content_length as usize,
