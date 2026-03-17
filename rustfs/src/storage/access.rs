@@ -148,7 +148,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
         if !bucket_name.is_empty()
             && !matches!(action, Action::S3Action(S3Action::CreateBucketAction))
             && if let Some(store) = new_object_layer_fn() {
-                store.get_bucket_info(bucket_name, &Default::default()).await.is_err_and(|e| is_err_bucket_not_found(e))
+                store.get_bucket_info(bucket_name, &Default::default()).await.is_err_and(|e| is_err_bucket_not_found(&e))
             } else {
                 false
             }
